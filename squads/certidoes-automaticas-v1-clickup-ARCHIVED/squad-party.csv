@@ -1,0 +1,4 @@
+id,name,title,icon,execution,path
+carlos-coordenador,Carlos Coordenador,Coordenador de Certidões,🎯,inline,./agents/carlos-coordenador.agent.md
+beto-burocracia,Beto Burocracia,Coletador de Certidões,📋,subagent,./agents/beto-burocracia.agent.md
+renata-resultados,Renata Resultados,Consolidadora de Resultados,✅,inline,./agents/renata-resultados.agent.md

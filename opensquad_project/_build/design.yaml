@@ -1,0 +1,128 @@
+squad:
+  code: "certidoes-automaticas"
+  name: "Certidões Automáticas"
+  description: "Coleta automaticamente 6 certidões por card do ClickUp (TST, TRF6 eproc, TRF6 PJE, TRT3, TJMG/RUPE e Receita Federal), salvando os PDFs no Google Drive e atualizando o card de origem."
+
+agents:
+  - id: "certidoes-automaticas/agents/carlos-coordenador"
+    name: "Carlos Coordenador"
+    title: "Coordenador de Certidões"
+    icon: "🎯"
+    execution: "inline"
+    role_summary: "Lê o card do ClickUp, valida campos obrigatórios, identifica múltiplas pessoas por card e cria a pasta do Google Drive para armazenamento dos PDFs."
+    skills: []
+    tasks:
+      - name: "read-clickup-card"
+        file: "tasks/read-clickup-card.md"
+        description: "Busca o card via ClickUp MCP e extrai os campos: NOME, CPF/CNPJ, TIPO DE PESSOA, DATA DE NASCIMENTO (se PF)"
+      - name: "validate-fields"
+        file: "tasks/validate-fields.md"
+        description: "Valida campos obrigatórios e detecta múltiplas pessoas no card"
+      - name: "create-drive-folder"
+        file: "tasks/create-drive-folder.md"
+        description: "Cria pasta no Google Drive com nome [NOME-CLIENTE]_[CARD-ID]"
+
+  - id: "certidoes-automaticas/agents/beto-burocracia"
+    name: "Beto Burocracia"
+    title: "Coletador de Certidões"
+    icon: "📋"
+    execution: "subagent"
+    role_summary: "Navega em portais governamentais via Playwright para coletar certidões. Execução paralela para 5 portais; TJMG/RUPE executa inline por requerer verificação de e-mail."
+    skills: []
+    tasks:
+      - name: "collect-tst"
+        file: "tasks/collect-tst.md"
+        description: "Emite CNDT no portal TST (cndt-certidao.tst.jus.br)"
+      - name: "collect-trf6-eproc"
+        file: "tasks/collect-trf6-eproc.md"
+        description: "Emite certidão no TRF6 eproc"
+      - name: "collect-trf6-pje"
+        file: "tasks/collect-trf6-pje.md"
+        description: "Emite certidão no TRF6 PJE"
+      - name: "collect-trt3"
+        file: "tasks/collect-trt3.md"
+        description: "Emite CEAT no portal TRT3 (MG)"
+      - name: "collect-tjmg-rupe"
+        file: "tasks/collect-tjmg-rupe.md"
+        description: "Solicita certidão no TJMG/RUPE com solicitante fixo (Pedro Ivo). Requer código de verificação por e-mail lido via Gmail MCP."
+      - name: "collect-receita-federal"
+        file: "tasks/collect-receita-federal.md"
+        description: "Emite certidão de regularidade na Receita Federal. PF: CPF + data de nascimento. PJ: CNPJ. Fallback: 2ª via por data de validade."
+
+  - id: "certidoes-automaticas/agents/renata-resultados"
+    name: "Renata Resultados"
+    title: "Consolidadora de Resultados"
+    icon: "✅"
+    execution: "inline"
+    role_summary: "Recebe todos os resultados das certidões, renomeia PDFs no padrão [ORGAO]_[NOME-CLIENTE]_[DATA].pdf, faz upload para o Google Drive, anexa no card do ClickUp, atualiza status e trata exceções (falhas e TJMG positiva)."
+    skills: []
+    tasks:
+      - name: "upload-to-drive"
+        file: "tasks/upload-to-drive.md"
+        description: "Renomeia e sobe PDFs para o Google Drive na pasta criada por Carlos"
+      - name: "update-clickup"
+        file: "tasks/update-clickup.md"
+        description: "Anexa PDFs no card, muda status para 'Certidões emitidas', adiciona comentários de falha quando aplicável"
+      - name: "handle-exceptions"
+        file: "tasks/handle-exceptions.md"
+        description: "Trata TJMG positiva (comentário + tag TJMG-PENDENTE) e falhas de portal"
+
+pipeline:
+  - step: 1
+    name: "coordenacao"
+    type: "agent"
+    agent: "certidoes-automaticas/agents/carlos-coordenador"
+    execution: "inline"
+    output_file: "squads/certidoes-automaticas/output/card-data.json"
+  - step: 2
+    name: "checkpoint-confirmar-dados"
+    type: "checkpoint"
+  - step: 3
+    name: "certidoes-paralelas"
+    type: "agent"
+    agent: "certidoes-automaticas/agents/beto-burocracia"
+    execution: "subagent"
+    input_file: "squads/certidoes-automaticas/output/card-data.json"
+    output_file: "squads/certidoes-automaticas/output/certidoes-parciais.json"
+    model_tier: "powerful"
+  - step: 4
+    name: "tjmg-rupe"
+    type: "agent"
+    agent: "certidoes-automaticas/agents/beto-burocracia"
+    execution: "inline"
+    input_file: "squads/certidoes-automaticas/output/card-data.json"
+    output_file: "squads/certidoes-automaticas/output/tjmg-result.json"
+  - step: 5
+    name: "consolidacao"
+    type: "agent"
+    agent: "certidoes-automaticas/agents/renata-resultados"
+    execution: "inline"
+    input_file: "squads/certidoes-automaticas/output/certidoes-parciais.json"
+    output_file: "squads/certidoes-automaticas/output/consolidado.json"
+
+investigation:
+  enriched: false
+
+research_brief: |
+  Portais de certidões governamentais brasileiros:
+  - TST CNDT: https://cndt-certidao.tst.jus.br/ (CPF ou CNPJ, emissão imediata)
+  - TRF6 eproc: https://certidao.trf6.jus.br/consulta
+  - TRF6 PJE: https://sistemas.trf6.jus.br/certidao/#/
+  - TRT3 CEAT: https://certidao.trt3.jus.br/certidao/feitosTrabalhistas/ (PF/PJ → CPF/CNPJ → captcha → Consultar)
+  - TJMG/RUPE: https://rupe.tjmg.jus.br/ (solicitante fixo + código de verificação por e-mail)
+  - Receita Federal: https://servicos.receitafederal.gov.br/servico/certidoes/#/home (PF: CPF+nasc / PJ: CNPJ / fallback: 2ª via)
+
+  ClickUp MCP disponível para leitura e atualização de cards.
+  Google Drive MCP disponível para criação de pastas e upload de arquivos.
+  Gmail MCP disponível para leitura de e-mails (código TJMG).
+  Playwright disponível para automação de navegador.
+
+skills_installed:
+  - "playwright"
+  - "clickup-mcp"
+  - "google-drive-mcp"
+  - "gmail-mcp"
+
+formats_selected: []
+
+best_practices_consulted: []

@@ -1,0 +1,8 @@
+name: deed-sync Pipeline
+version: "1.0.0"
+description: Pipeline de emissão automática das 6 certidões via Playwright
+
+steps:
+  - pipeline/steps/step-01-emissao-certidoes.md
+
+checkpoints: []

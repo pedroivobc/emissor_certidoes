@@ -1,0 +1,70 @@
+squad_code: "certidoes-automaticas"
+purpose: "Automatizar a emissão e coleta de 6 certidões por card (TST, TRF6 eproc, TRF6 PJE, TRT3, TJMG/RUPE e Receita Federal) a partir de dados de clientes no ClickUp, salvando os PDFs no Google Drive e atualizando o card de origem."
+domain: "automation"
+
+company:
+  name: "Clemente Assessoria"
+  tone: "Profissional, acessível e orientado ao cliente. Simplifica processos burocráticos com agilidade, precisão e atendimento personalizado."
+  products: "Escrituras, assessoria para corretoras, regularização de imóveis, consultoria para construtoras e incorporadoras, operações de crédito imobiliário."
+
+language: "Português (Brasil)"
+
+context:
+  trigger: "ClickUp webhook — card na lista 'Escrituras - Projeto' (Workspace Escrituras) com campos customizados NOME, CPF ou CNPJ e TIPO DE PESSOA preenchidos."
+  systems:
+    - "ClickUp (gatilho + atualização de status + anexo de PDFs + comentários)"
+    - "Google Drive (armazenamento de PDFs em pasta nomeada com identificador do card/cliente)"
+    - "Gmail (leitura do código de verificação para TJMG/RUPE)"
+    - "Playwright (automação dos portais governamentais)"
+  portals:
+    - id: "tst"
+      name: "TST"
+      url: "https://www.tst.jus.br/certidao1"
+    - id: "trf6-eproc"
+      name: "TRF6 eproc"
+      url: "https://certidao.trf6.jus.br/consulta"
+    - id: "trf6-pje"
+      name: "TRF6 PJE"
+      url: "https://sistemas.trf6.jus.br/certidao/#/"
+    - id: "trt3"
+      name: "TRT3"
+      url: "https://certidao.trt3.jus.br/certidao/feitosTrabalhistas/"
+      nav_flow: "Selecionar PF/PJ → CPF/CNPJ → captcha → Consultar"
+    - id: "tjmg-rupe"
+      name: "TJMG / RUPE"
+      url: "https://rupe.tjmg.jus.br/rupe/justica/publico/certidoes/criarSolicitacaoCertidao.rupe?solicitacaoPublica=true"
+      fixed_requester:
+        nome: "PEDRO IVO BATISTA CLEMENTE"
+        cpf: "11773105620"
+        email: "contato@clementeassessoria.com"
+      email_verification: true
+    - id: "receita-federal"
+      name: "Receita Federal"
+      url: "https://servicos.receitafederal.gov.br/servico/certidoes/#/home"
+      pf_fields: ["cpf", "data_nascimento"]
+      pj_fields: ["cnpj"]
+      fallback: "consultar certidão > Data de Validade > download da 2ª via"
+  card_fields_required:
+    - "NOME"
+    - "CPF ou CNPJ"
+    - "TIPO DE PESSOA (física ou jurídica)"
+    - "DATA DE NASCIMENTO (obrigatório para Pessoa Física — Receita Federal)"
+  multi_person_per_card: true
+  execution_mode: "parallel or sequential (configurable)"
+  output_naming_pattern: "[ORGAO]_[NOME-CLIENTE]_[DATA].pdf"
+  clickup_status_on_success: "Certidões emitidas"
+  tjmg_positive_rule:
+    action: "comment on card with protocol number, CPF/CNPJ, warning about manual emission in 1-2 business days"
+    tag: "TJMG-PENDENTE"
+  failure_rule: "Register comment on ClickUp card indicating which portal failed and reason"
+
+tools_needed:
+  - "Playwright (browser automation)"
+  - "ClickUp MCP (built-in)"
+  - "Google Drive MCP (built-in)"
+  - "Gmail MCP (built-in)"
+
+investigation:
+  enabled: false
+
+target_formats: []

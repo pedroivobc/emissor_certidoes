@@ -1,0 +1,32 @@
+name: deed-sync
+code: deed-sync
+description: >
+  Automatiza a emissão de 6 certidões de pessoa física brasileira
+  (TST, TRF6 eproc, TRF6 PJE, TRT3, TJMG/RUPE, Receita Federal PGFN)
+  via uma API FastAPI local, usando Playwright e 2captcha.
+  Os PDFs gerados são salvos em pasta local sincronizada com o Google Drive.
+icon: 📄
+version: "1.0.0"
+language: pt-BR
+
+agents:
+  - agents/emissor-certidoes.agent.md
+
+pipeline: pipeline/pipeline.yaml
+
+skills:
+  - playwright
+  - 2captcha
+
+data: []
+
+config:
+  output_dir: output/pdfs
+  solicitante_fixo:
+    nome: Pedro Ivo Batista Clemente
+    cpf: "117.731.056-20"
+    email: contato@clementeassessoria.com
+
+env:
+  - TWOCAPTCHA_API_KEY
+  - GOOGLE_DRIVE_FOLDER_ID

@@ -1,0 +1,22 @@
+id: "certidoes-automaticas"
+name: "Certidões Automáticas"
+description: "Coleta automaticamente 6 certidões por card do ClickUp (TST, TRF6 eproc, TRF6 PJE, TRT3, TJMG/RUPE e Receita Federal), salvando os PDFs no Google Drive e atualizando o card de origem."
+icon: "📜"
+version: "1.0.0"
+
+agents:
+  - carlos-coordenador
+  - beto-burocracia
+  - renata-resultados
+
+skills:
+  - web_fetch
+
+pipeline: pipeline/pipeline.yaml
+
+data:
+  - pipeline/data/research-brief.md
+  - pipeline/data/domain-framework.md
+  - pipeline/data/quality-criteria.md
+  - pipeline/data/output-examples.md
+  - pipeline/data/anti-patterns.md

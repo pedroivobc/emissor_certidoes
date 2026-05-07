@@ -1,0 +1,29 @@
+# Credenciais (NUNCA commitar)
+credenciais.env
+google_oauth_client.json
+google_oauth_token.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# macOS
+.DS_Store
+
+# Output local (PDFs gerados, testes)
+output/pdfs/
+output/testes/
+
+# Backups
+*.backup
+*.backup2
+*.antigravity-orig

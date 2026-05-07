@@ -1,0 +1,630 @@
+"""
+tjmg_scraper.py
+Consulta automatizada ao TJMG/RUPE via Playwright + Gmail API OTP.
+
+Fluxo:
+  1. Testa autenticação Gmail (falha cedo se OAuth inválido)
+  2. Abre o portal RUPE com Playwright (headless por padrão)
+  3. Preenche os dados da certidão, do consultado e do solicitante
+  4. Clica em "Gerar Código" → abre popup intermediário
+  5. Clica em "Enviar Código de Verificação" no popup → email é disparado
+  6. Faz polling no Gmail pelo OTP (até 180s)
+  7. Preenche o OTP e clica em "Salvar"
+  8. Cenário A — certidão negativa: captura PDF (download ou preview)
+  9. Cenário B — pendente/positiva: extrai protocolo e retorna instrução manual
+
+Variáveis de ambiente:
+  TJMG_HEADLESS=false   → abre browser visível (útil para debug)
+
+CLI de teste:
+  python tjmg_scraper.py <CPF_ou_CNPJ> "<Nome Completo>"
+  python tjmg_scraper.py 11773105620 "PEDRO IVO BATISTA CLEMENTE"
+"""
+
+import asyncio
+import json
+import logging
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from playwright.async_api import (
+    TimeoutError as PlaywrightTimeout,
+    async_playwright,
+)
+
+from gmail_reader import GmailReader
+
+# ─── Configuração ──────────────────────────────────────────────────────────────
+
+logger = logging.getLogger("deed-sync.tjmg_scraper")
+
+HEADLESS = os.getenv("TJMG_HEADLESS", "true").lower() not in ("false", "0", "no")
+
+# Timeout aumentado de 60s para 180s — o popup intermediário e a entrega
+# do email pelo TJMG podem somar mais que 1 minuto em horários de pico.
+TIMEOUT_OTP_SEGUNDOS = 180
+
+OUTPUT_BASE = Path(__file__).parent / "output" / "pdfs"
+
+URL_CRIAR = (
+    "https://rupe.tjmg.jus.br/rupe/justica/publico/certidoes/"
+    "criarSolicitacaoCertidao.rupe?solicitacaoPublica=true"
+)
+URL_ACOMPANHAR = (
+    "https://rupe.tjmg.jus.br/rupe/justica/publico/certidoes/"
+    "consultarAndamentoSolicitacaoCertidao.rupe?solicitacaoPublica=true"
+)
+
+# Dados fixos do solicitante Pedro Ivo (usados internamente — não logar)
+_SOLICITANTE_NOME = "PEDRO IVO BATISTA CLEMENTE"
+_SOLICITANTE_CPF = "117.731.056-20"
+_SOLICITANTE_EMAIL = "contato@clementeassessoria.com"
+
+REGEX_PROTOCOLO = re.compile(r"[Pp]rotocolo[:\s#]*(\d[\d./\-]+)", re.IGNORECASE)
+
+
+# ─── Helpers de formatação ─────────────────────────────────────────────────────
+
+def _formatar_cpf(digitos: str) -> str:
+    """Formata 11 dígitos como CPF: XXX.XXX.XXX-XX"""
+    return f"{digitos[:3]}.{digitos[3:6]}.{digitos[6:9]}-{digitos[9:]}"
+
+
+def _formatar_cnpj(digitos: str) -> str:
+    """Formata 14 dígitos como CNPJ: XX.XXX.XXX/XXXX-XX"""
+    return f"{digitos[:2]}.{digitos[2:5]}.{digitos[5:8]}/{digitos[8:12]}-{digitos[12:]}"
+
+
+def _timestamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _destino_pdf(documento: str) -> Path:
+    pasta = OUTPUT_BASE / documento
+    pasta.mkdir(parents=True, exist_ok=True)
+    return pasta / f"tjmg_{_timestamp()}.pdf"
+
+
+def _resultado_base(inicio: float) -> dict:
+    return {
+        "status": None,
+        "pdf_path": None,
+        "protocolo": None,
+        "cpf_solicitante": _SOLICITANTE_CPF,
+        "url_acompanhamento": URL_ACOMPANHAR,
+        "instrucao": None,
+        "duracao_segundos": None,
+        "erro": None,
+        "detalhes_tecnicos": None,
+    }
+
+
+def _finalizar(resultado: dict, inicio: float) -> dict:
+    resultado["duracao_segundos"] = round(time.monotonic() - inicio, 1)
+    return resultado
+
+
+# ─── Preenchimento do formulário ───────────────────────────────────────────────
+
+async def _preencher_secao_certidao(page) -> None:
+    """
+    Seção "Certidão":
+      - 1ª Instância (radio)
+      - Tipo: Normal (dropdown, já default — garante seleção)
+      - Natureza: Cível (radio)
+      - Comarca: JUIZ DE FORA (dropdown — não é o default)
+    """
+    logger.info("Preenchendo seção Certidão...")
+
+    # 1ª Instância — radio
+    try:
+        await page.get_by_label("1ª Instância").check(timeout=5000)
+    except Exception:
+        # Fallback por valor/label alternativo
+        await page.locator("input[type=radio][value*='1']").first.check(timeout=5000)
+
+    # Natureza: Cível — radio
+    try:
+        await page.get_by_label("Cível").check(timeout=5000)
+    except Exception:
+        await page.locator("input[type=radio][value*='ivel']").first.check(timeout=5000)
+
+    # Tipo: Normal — dropdown (select)
+    try:
+        await page.get_by_label("Tipo").select_option(label="Normal", timeout=5000)
+    except Exception:
+        # Tenta pelo valor 'N' ou texto 'Normal'
+        await page.locator("select").filter(has_text="Normal").select_option(
+            label="Normal", timeout=5000
+        )
+
+    # Comarca: JUIZ DE FORA — dropdown
+    try:
+        await page.get_by_label("Comarca").select_option(label="JUIZ DE FORA", timeout=5000)
+    except Exception:
+        # Fallback: seleciona pelo texto no <option>
+        selects = page.locator("select")
+        count = await selects.count()
+        for i in range(count):
+            sel = selects.nth(i)
+            opts = await sel.inner_text()
+            if "JUIZ DE FORA" in opts:
+                await sel.select_option(label="JUIZ DE FORA", timeout=5000)
+                break
+
+    logger.info("Seção Certidão preenchida.")
+
+
+async def _preencher_secao_dados(page, documento: str, nome: str) -> None:
+    """
+    Seção "Dados da Certidão" (CONSULTADO):
+      - Detecta CPF (11 dígitos) ou CNPJ (14 dígitos)
+      - Seleciona radio Física/Jurídica
+      - Preenche CPF/CNPJ formatado e Nome
+    """
+    logger.info("Preenchendo seção Dados do Consultado...")
+
+    if len(documento) == 11:
+        doc_formatado = _formatar_cpf(documento)
+        # Radio: Física
+        try:
+            await page.get_by_label("Física").check(timeout=5000)
+        except Exception:
+            await page.locator("input[type=radio]").filter(
+                has_text="Física"
+            ).check(timeout=5000)
+    elif len(documento) == 14:
+        doc_formatado = _formatar_cnpj(documento)
+        # Radio: Jurídica
+        try:
+            await page.get_by_label("Jurídica").check(timeout=5000)
+        except Exception:
+            await page.locator("input[type=radio]").filter(
+                has_text="Jurídica"
+            ).check(timeout=5000)
+    else:
+        raise ValueError(f"Documento inválido: {len(documento)} dígitos (esperado 11 ou 14)")
+
+    # Campo CPF/CNPJ — tenta pelo label; fallback por name/id
+    try:
+        await page.get_by_label("CPF").fill(doc_formatado, timeout=5000)
+    except Exception:
+        campo = page.locator("input[name*='cpf'], input[id*='cpf'], input[name*='Cpf']").first
+        await campo.fill(doc_formatado, timeout=5000)
+
+    # Campo Nome do consultado
+    try:
+        await page.get_by_label("Nome").first.fill(nome, timeout=5000)
+    except Exception:
+        campo = page.locator(
+            "input[name*='nome'], input[id*='nome'], input[name*='Nome']"
+        ).first
+        await campo.fill(nome, timeout=5000)
+
+    logger.info("Seção Dados do Consultado preenchida.")
+
+
+async def _preencher_secao_solicitante(page, nome: str, cpf: str, email: str) -> None:
+    """
+    Seção "Solicitante":
+      - Nome, CPF, E-mail, Confirmação E-mail
+      - NÃO preenche o código de verificação aqui
+    """
+    logger.info("Preenchendo seção Solicitante...")
+
+    # Preenche pelo label; usa seletores de fallback genéricos se necessário
+    async def _fill_by_label_or_selector(labels: list[str], selectors: list[str], valor: str):
+        for lbl in labels:
+            try:
+                await page.get_by_label(lbl).fill(valor, timeout=4000)
+                return
+            except Exception:
+                continue
+        for sel in selectors:
+            try:
+                await page.locator(sel).fill(valor, timeout=4000)
+                return
+            except Exception:
+                continue
+        raise RuntimeError(f"Não encontrei campo para preencher: {labels}")
+
+    await _fill_by_label_or_selector(
+        ["Nome do Solicitante", "Nome"],
+        ["input[name*='nomeSolicitante']", "input[id*='nomeSolicitante']"],
+        nome,
+    )
+    await _fill_by_label_or_selector(
+        ["CPF do Solicitante", "CPF Solicitante"],
+        ["input[name*='cpfSolicitante']", "input[id*='cpfSolicitante']"],
+        cpf,
+    )
+    await _fill_by_label_or_selector(
+        ["E-mail", "Email"],
+        ["input[name*='email']:not([name*='onfirmacao'])", "input[id*='email']:not([id*='onfirmacao'])"],
+        email,
+    )
+    await _fill_by_label_or_selector(
+        ["Confirmação de E-mail", "Confirmação E-mail", "Confirmar E-mail"],
+        ["input[name*='onfirmacao'], input[id*='onfirmacao'], input[name*='emailConfirmacao']"],
+        email,
+    )
+
+    logger.info("Seção Solicitante preenchida.")
+
+
+# ─── NOVO: Disparar OTP em 2 cliques (Gerar Código + Enviar Código) ────────────
+
+async def _disparar_envio_otp(page) -> None:
+    """
+    Dispara o envio do OTP por email em 2 cliques:
+      1. "Gerar Código" — abre popup de confirmação
+      2. "Enviar Código de Verificação" — botão dentro do popup que efetivamente
+         dispara o email pro solicitante.
+
+    O popup tem texto fixo:
+      "Para garantir a digitação de um e-mail válido, visando a segurança da
+       solicitação, um código de verificação será enviado..."
+    """
+    # 1) Clicar em "Gerar Código"
+    logger.info("Clicando em 'Gerar Código' (abre popup de confirmação)...")
+    try:
+        await page.click("text=Gerar Código", timeout=10_000)
+    except Exception as exc:
+        raise RuntimeError(f"Não encontrei o botão 'Gerar Código': {exc}")
+
+    # Espera o popup aparecer e renderizar
+    await asyncio.sleep(1.5)
+
+    # 2) Clicar em "Enviar Código de Verificação" no popup
+    #    Múltiplos fallbacks: texto exato, botão input, value do input
+    logger.info("Clicando em 'Enviar Código de Verificação' no popup...")
+    seletores_envio = [
+        'text="Enviar Código de Verificação"',
+        'button:has-text("Enviar Código de Verificação")',
+        'input[type="button"][value*="Enviar Código"]',
+        'input[type="submit"][value*="Enviar Código"]',
+        'input[value*="Enviar Código de Verificação"]',
+    ]
+
+    clicado = False
+    ultima_excecao: Exception | None = None
+    for seletor in seletores_envio:
+        try:
+            await page.locator(seletor).first.click(timeout=5000)
+            clicado = True
+            logger.info("Popup confirmado via seletor: %s", seletor)
+            break
+        except Exception as exc:
+            ultima_excecao = exc
+            continue
+
+    if not clicado:
+        raise RuntimeError(
+            f"Não encontrei o botão 'Enviar Código de Verificação' no popup. "
+            f"Última exceção: {ultima_excecao}"
+        )
+
+    # Pequena pausa para o portal processar o envio
+    await asyncio.sleep(1)
+
+
+# ─── Captura de PDF ────────────────────────────────────────────────────────────
+
+async def _capturar_pdf_download(page, context, destino: Path) -> str | None:
+    """
+    Tenta capturar PDF via download automático do browser.
+    Retorna o caminho absoluto do PDF salvo, ou None se não houve download.
+    """
+    try:
+        async with page.expect_download(timeout=30_000) as dl_info:
+            await page.click("text=Salvar", timeout=10_000)
+        download = await dl_info.value
+        caminho_temp = await download.path()
+        if caminho_temp:
+            destino.write_bytes(Path(caminho_temp).read_bytes())
+            logger.info("PDF salvo via download: %s", destino.name)
+            return str(destino.resolve())
+    except PlaywrightTimeout:
+        logger.info("Nenhum download automático detectado em 30s.")
+    except Exception as exc:
+        logger.warning("Erro ao capturar download: %s", exc)
+    return None
+
+
+async def _capturar_pdf_nova_aba(context, destino: Path) -> str | None:
+    """
+    Verifica se uma nova aba com PDF abriu após o Salvar.
+    Retorna o caminho do PDF salvo, ou None.
+    """
+    pages = context.pages
+    for p in pages[1:]:  # ignora a aba principal
+        url = p.url
+        if url.endswith(".pdf") or "pdf" in url.lower():
+            logger.info("PDF detectado em nova aba: %s", url)
+            try:
+                conteudo = await p.pdf()
+                destino.write_bytes(conteudo)
+                logger.info("PDF salvo via nova aba: %s", destino.name)
+                return str(destino.resolve())
+            except Exception as exc:
+                logger.warning("Erro ao salvar PDF da nova aba: %s", exc)
+    return None
+
+
+async def _extrair_protocolo(page) -> str | None:
+    """Tenta extrair número de protocolo do conteúdo da página."""
+    try:
+        texto = await page.inner_text("body", timeout=5000)
+        match = REGEX_PROTOCOLO.search(texto)
+        if match:
+            return match.group(1).strip()
+    except Exception:
+        pass
+    return None
+
+
+# ─── Função principal ──────────────────────────────────────────────────────────
+
+async def consultar_tjmg(
+    cpf: str,
+    nome_solicitante: str,
+    cpf_solicitante: str,
+    email_solicitante: str,
+    nome_consultado: str | None = None,
+    documento_consultado: str | None = None,
+) -> dict:
+    """
+    Consulta a certidão TJMG/RUPE via Playwright + Gmail OTP.
+
+    Args:
+        cpf:                CPF/CNPJ do consultado (apenas dígitos).
+        nome_solicitante:   Nome do solicitante (Pedro Ivo — hardcoded no scraper.py).
+        cpf_solicitante:    CPF do solicitante formatado.
+        email_solicitante:  E-mail do solicitante.
+        nome_consultado:    Nome completo do consultado (OBRIGATÓRIO).
+        documento_consultado: Alias de cpf (ignorado se cpf já fornecido).
+
+    Returns:
+        Dict com status, pdf_path, protocolo, erro, etc.
+    """
+    inicio = time.monotonic()
+    resultado = _resultado_base(inicio)
+
+    # ── 1. Validação ──────────────────────────────────────────────────────────
+    doc = cpf or documento_consultado or ""
+    doc = "".join(c for c in doc if c.isdigit())
+
+    if not doc or len(doc) not in (11, 14):
+        resultado["status"] = "erro"
+        resultado["erro"] = f"CPF/CNPJ inválido: esperado 11 ou 14 dígitos, recebido '{cpf}'."
+        return _finalizar(resultado, inicio)
+
+    if not nome_consultado:
+        resultado["status"] = "erro"
+        resultado["erro"] = "nome_consultado é obrigatório para consulta ao TJMG."
+        return _finalizar(resultado, inicio)
+
+    logger.info("=" * 55)
+    logger.info("TJMG/RUPE — Iniciando consulta")
+    logger.info("Consultado: doc=%s*** | nome=%s", doc[:4], nome_consultado)
+    logger.info("=" * 55)
+
+    # ── 2. Testar Gmail ANTES de abrir browser ────────────────────────────────
+    logger.info("Testando autenticação Gmail...")
+    try:
+        gmail = GmailReader()
+        gmail.testar_acesso()
+    except Exception as exc:
+        resultado["status"] = "erro"
+        resultado["erro"] = (
+            f"Falha na autenticação Gmail: {exc}. "
+            "Execute oauth_setup.py para renovar o token."
+        )
+        resultado["detalhes_tecnicos"] = str(exc)
+        return _finalizar(resultado, inicio)
+
+    # ── 3. Playwright ─────────────────────────────────────────────────────────
+    logger.info("Iniciando Playwright (headless=%s)...", HEADLESS)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=HEADLESS)
+        context = await browser.new_context(
+            accept_downloads=True,
+            locale="pt-BR",
+            timezone_id="America/Sao_Paulo",
+        )
+        page = await context.new_page()
+
+        try:
+            # ── 4. Abrir RUPE ─────────────────────────────────────────────
+            logger.info("Abrindo portal RUPE...")
+            try:
+                await page.goto(URL_CRIAR, timeout=60_000)
+                await page.wait_for_load_state("networkidle", timeout=30_000)
+            except PlaywrightTimeout:
+                resultado["status"] = "erro"
+                resultado["erro"] = "Portal RUPE indisponível ou muito lento (timeout 60s)."
+                return _finalizar(resultado, inicio)
+            except Exception as exc:
+                resultado["status"] = "erro"
+                resultado["erro"] = f"Erro ao abrir portal RUPE: {exc}"
+                resultado["detalhes_tecnicos"] = str(exc)
+                return _finalizar(resultado, inicio)
+
+            # Verificar bloqueio anti-bot
+            titulo = await page.title()
+            texto_pagina = await page.inner_text("body")
+            if any(s in texto_pagina.lower() for s in ("verifique se você é humano", "captcha", "acesso negado")):
+                resultado["status"] = "erro"
+                resultado["erro"] = (
+                    "Possível bloqueio anti-bot detectado. "
+                    "Tente com TJMG_HEADLESS=false para depurar."
+                )
+                resultado["detalhes_tecnicos"] = f"Título da página: {titulo}"
+                return _finalizar(resultado, inicio)
+
+            # ── 5. Preencher formulário ───────────────────────────────────
+            try:
+                await _preencher_secao_certidao(page)
+                await _preencher_secao_dados(page, doc, nome_consultado)
+                await _preencher_secao_solicitante(
+                    page,
+                    nome_solicitante,
+                    cpf_solicitante,
+                    email_solicitante,
+                )
+            except Exception as exc:
+                resultado["status"] = "erro"
+                resultado["erro"] = f"Erro ao preencher formulário RUPE: {exc}"
+                resultado["detalhes_tecnicos"] = str(exc)
+                return _finalizar(resultado, inicio)
+
+            # ── 6. Marcar timestamp e disparar envio do OTP ──────────────
+            #     IMPORTANTE: o timestamp é capturado ANTES dos cliques
+            #     pra que a query do Gmail (after:timestamp) capture o
+            #     email novo, não algum email antigo do mesmo remetente.
+            timestamp_envio = datetime.now(timezone.utc)
+            try:
+                await _disparar_envio_otp(page)
+            except Exception as exc:
+                resultado["status"] = "erro"
+                resultado["erro"] = f"Erro ao disparar envio do OTP: {exc}"
+                resultado["detalhes_tecnicos"] = str(exc)
+                return _finalizar(resultado, inicio)
+
+            # ── 7. Aguardar OTP via Gmail (até 180s) ──────────────────────
+            logger.info("Aguardando OTP por email (timeout=%ds)...", TIMEOUT_OTP_SEGUNDOS)
+            try:
+                otp = await gmail.aguardar_otp(timestamp_envio, timeout=TIMEOUT_OTP_SEGUNDOS)
+            except TimeoutError as exc:
+                resultado["status"] = "erro"
+                resultado["erro"] = (
+                    f"Email do RUPE com OTP não chegou em {TIMEOUT_OTP_SEGUNDOS}s. "
+                    "Verifique a caixa de entrada e pasta de spam de "
+                    "contato@clementeassessoria.com."
+                )
+                resultado["detalhes_tecnicos"] = str(exc)
+                return _finalizar(resultado, inicio)
+            except Exception as exc:
+                resultado["status"] = "erro"
+                resultado["erro"] = f"Erro ao aguardar OTP: {exc}"
+                resultado["detalhes_tecnicos"] = str(exc)
+                return _finalizar(resultado, inicio)
+
+            # ── 8. Preencher OTP ──────────────────────────────────────────
+            logger.info("OTP recebido. Preenchendo código de verificação...")
+            try:
+                campo_otp = page.locator(
+                    "input[name*='codigo'], input[id*='codigo'], "
+                    "input[name*='Codigo'], input[placeholder*='digo']"
+                ).first
+                await campo_otp.fill(otp, timeout=5000)
+            except Exception as exc:
+                resultado["status"] = "erro"
+                resultado["erro"] = f"Não encontrei o campo de código de verificação: {exc}"
+                resultado["detalhes_tecnicos"] = str(exc)
+                return _finalizar(resultado, inicio)
+
+            # ── 9. Submeter — capturando possível download ────────────────
+            logger.info("Submetendo formulário (Salvar)...")
+            destino = _destino_pdf(doc)
+
+            pdf_path = await _capturar_pdf_download(page, context, destino)
+
+            if pdf_path:
+                resultado["status"] = "concluido"
+                resultado["pdf_path"] = pdf_path
+                logger.info("PDF salvo: %s", pdf_path)
+                return _finalizar(resultado, inicio)
+
+            # ── 10. Sem download direto — verificar nova aba ou protocolo ─
+            await asyncio.sleep(3)  # aguarda possível abertura de aba/redirecionamento
+
+            # Tentar PDF em nova aba
+            pdf_path = await _capturar_pdf_nova_aba(context, destino)
+            if pdf_path:
+                resultado["status"] = "concluido"
+                resultado["pdf_path"] = pdf_path
+                logger.info("PDF salvo (nova aba): %s", pdf_path)
+                return _finalizar(resultado, inicio)
+
+            # Verificar protocolo na tela (cenário pendente)
+            protocolo = await _extrair_protocolo(page)
+            if protocolo:
+                logger.info("Solicitação pendente — protocolo: %s", protocolo)
+                resultado["status"] = "pendente_manual"
+                resultado["protocolo"] = protocolo
+                resultado["instrucao"] = (
+                    "Aguardar 1-2 dias úteis e usar o endpoint /coletar-tjmg "
+                    "para buscar a certidão pelo protocolo."
+                )
+                return _finalizar(resultado, inicio)
+
+            # Nenhum PDF nem protocolo — submissão pode ter falhado
+            # Verificar mensagens de erro na página (sem usar a palavra "erro"
+            # que é genérica demais e gera falso positivo)
+            texto_atual = await page.inner_text("body")
+            for trecho in ("inválido", "divergente", "não encontrado", "falha"):
+                if trecho in texto_atual.lower():
+                    resultado["status"] = "erro"
+                    resultado["erro"] = (
+                        f"Dados rejeitados pelo RUPE. Trecho da página: "
+                        f"{texto_atual[:300].strip()}"
+                    )
+                    return _finalizar(resultado, inicio)
+
+            resultado["status"] = "erro"
+            resultado["erro"] = (
+                "Submissão concluída, mas nem PDF nem protocolo foram detectados. "
+                "Verifique o portal manualmente."
+            )
+            resultado["detalhes_tecnicos"] = texto_atual[:500]
+            return _finalizar(resultado, inicio)
+
+        except Exception as exc:
+            logger.exception("Exceção inesperada no fluxo TJMG")
+            resultado["status"] = "erro"
+            resultado["erro"] = f"Erro inesperado: {exc}"
+            resultado["detalhes_tecnicos"] = str(exc)
+            return _finalizar(resultado, inicio)
+
+        finally:
+            await browser.close()
+            logger.info("Browser fechado.")
+
+
+# ─── CLI de teste ──────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import logging as _logging
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    if len(sys.argv) < 3:
+        print(
+            "Uso: python tjmg_scraper.py <CPF_ou_CNPJ> \"<Nome Completo>\"\n"
+            "Exemplo: python tjmg_scraper.py 11773105620 \"PEDRO IVO BATISTA CLEMENTE\"\n"
+            "Para modo visível: TJMG_HEADLESS=false python tjmg_scraper.py ..."
+        )
+        sys.exit(1)
+
+    _doc = "".join(c for c in sys.argv[1] if c.isdigit())
+    _nome = sys.argv[2]
+
+    _resultado = asyncio.run(
+        consultar_tjmg(
+            cpf=_doc,
+            nome_solicitante=_SOLICITANTE_NOME,
+            cpf_solicitante=_SOLICITANTE_CPF,
+            email_solicitante=_SOLICITANTE_EMAIL,
+            nome_consultado=_nome,
+        )
+    )
+    print(json.dumps(_resultado, ensure_ascii=False, indent=2, default=str))

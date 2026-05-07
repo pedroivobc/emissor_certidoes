@@ -1,0 +1,2 @@
+id,name,title,icon,path
+emissor-certidoes,Emissor Eletronico,Emissor de Certidões,📄,./agents/emissor-certidoes.agent.md

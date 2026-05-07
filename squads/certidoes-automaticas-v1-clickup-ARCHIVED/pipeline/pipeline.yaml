@@ -1,0 +1,42 @@
+id: "certidoes-automaticas"
+name: "Pipeline de Certidões Automáticas"
+description: "Coleta as 6 certidões (TST, TRF6 eproc, TRF6 PJE, TRT3, TJMG/RUPE e Receita Federal) a partir de um card do ClickUp."
+version: "1.0.0"
+
+steps:
+  - step: 1
+    name: "coordenacao"
+    file: "steps/step-01-coordenacao.md"
+    type: "agent"
+    agent: "carlos-coordenador"
+    execution: "inline"
+
+  - step: 2
+    name: "checkpoint-confirmar-dados"
+    file: "steps/step-02-checkpoint-confirmar-dados.md"
+    type: "checkpoint"
+
+  - step: 3
+    name: "certidoes-paralelas"
+    file: "steps/step-03-certidoes-paralelas.md"
+    type: "agent"
+    agent: "beto-burocracia"
+    execution: "subagent"
+
+  - step: 4
+    name: "tjmg-rupe"
+    file: "steps/step-04-tjmg-rupe.md"
+    type: "agent"
+    agent: "beto-burocracia"
+    execution: "inline"
+
+  - step: 5
+    name: "consolidacao"
+    file: "steps/step-05-consolidacao.md"
+    type: "agent"
+    agent: "renata-resultados"
+    execution: "inline"
+
+checkpoints:
+  - step: 2
+    name: "Confirmar dados do card antes de executar"
